@@ -1,13 +1,15 @@
+from forward_tracer import ForwardTrace, ForwardTracer
 import torch
 from transformers import AutoTokenizer, LlamaForCausalLM
 from sklearn.decomposition import PCA
 from ICVLayer import ICVLayer, add_icv_layers, remove_icv_layers
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = "cuda"
+# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load the tokenizer and model
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
-model = LlamaForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct")
+model = LlamaForCausalLM.from_pretrained("meta-llama/Meta-Llama-3-8B-Instruct").to("cuda")
 model.eval()
 
 # Example demonstration examples for dialogue safety
@@ -77,61 +79,53 @@ tokenized_demos = tokenize_demonstrations(
 #             icvs.append(icv.mean(dim=1))  # Averaging across tokens
 #     return torch.stack(icvs)
 
+def get_hiddenstates(model, inputs):
+        h_all = []
+
+        for example_id in range(len(inputs)):
+            embeddings_for_all_styles= []
+            for style_id in range(len(inputs[example_id])):
+                forward_trace = ForwardTrace()
+                context_manager = ForwardTracer(model, forward_trace)
+                with context_manager:
+                    _ = model(
+                    input_ids=torch.tensor(inputs[example_id][style_id]['input_ids']).unsqueeze(0).cuda(), 
+                    attention_mask = torch.tensor(inputs[example_id][style_id]['attention_mask']).unsqueeze(0).cuda(), 
+                    output_attentions=False,
+                    output_hidden_states=False
+                    )
+                    h = forward_trace.residual_stream.hidden
+                embedding_token = []
+                for layer in range(len(h)):
+                    embedding_token.append(h[layer][:,-1])
+                embedding_token = torch.cat(embedding_token, dim=0).cpu().clone()
+                embeddings_for_all_styles.append(embedding_token)
+            h_all.append(tuple(embeddings_for_all_styles))
+        return h_all
+
+
 def compute_icv(model, tokenized_demos, rank=1):
-    device = next(model.parameters()).device  # Get the device of the model
-    
-    hidden_states_all = []
-    pos_all = []
+    hidden_states = get_hiddenstates(model, tokenized_demos) #each element, layer x len_tokens x dim
+    num_demonstration = len(hidden_states)
     neg_all = []
+    pos_all = []
 
-    max_length = 0
-    hidden_size = None
+    hidden_states_all = []
 
-    # Find the maximum length of the hidden states and get hidden size
-    for input_ids, output_ids in tokenized_demos:
-        input_ids, output_ids = input_ids.to(device), output_ids.to(device)
-        with torch.no_grad():
-            input_hidden_states = model(input_ids, output_hidden_states=True, return_dict=True)['hidden_states']
-            output_hidden_states = model(output_ids, output_hidden_states=True, return_dict=True)['hidden_states']
-            max_length = max(max_length, input_hidden_states[-1].size(1), output_hidden_states[-1].size(1))
-            if hidden_size is None:
-                hidden_size = input_hidden_states[-1].size(-1)
+    for demonstration_id in range(num_demonstration):
+        h = hidden_states[demonstration_id][1].view(-1) - hidden_states[demonstration_id][0].view(-1)
+        hidden_states_all.append(h)
+        neg_all.append(hidden_states[demonstration_id][0].view(-1))
+        pos_all.append(hidden_states[demonstration_id][1].view(-1))
+    fit_data = torch.stack(hidden_states_all)
+    neg_emb = torch.stack(neg_all).mean(0)
+    pos_emb = torch.stack(pos_all).mean(0)
 
-    # Compute hidden states and pad them
-    for input_ids, output_ids in tokenized_demos:
-        input_ids, output_ids = input_ids.to(device), output_ids.to(device)
-        with torch.no_grad():
-            input_hidden_states = model(input_ids, output_hidden_states=True, return_dict=True)['hidden_states']
-            output_hidden_states = model(output_ids, output_hidden_states=True, return_dict=True)['hidden_states']
-
-            aligned_input_hidden = torch.nn.functional.pad(input_hidden_states[-1], (0, 0, 0, max_length - input_hidden_states[-1].size(1)))
-            aligned_output_hidden = torch.nn.functional.pad(output_hidden_states[-1], (0, 0, 0, max_length - output_hidden_states[-1].size(1)))
-
-            hidden_states_all.append(aligned_output_hidden - aligned_input_hidden)
-            pos_all.append(aligned_output_hidden)
-            neg_all.append(aligned_input_hidden)
-
-    hidden_states_all = torch.cat(hidden_states_all, dim=0)
-    pos_all = torch.cat(pos_all, dim=0)
-    neg_all = torch.cat(neg_all, dim=0)
-
-    # Reshape for PCA
-    hidden_states_flat = hidden_states_all.view(-1, hidden_size).cpu().numpy()
-
-    # Ensure rank is not larger than the number of features
-    rank = min(rank, hidden_size)
-
-    pca = PCA(n_components=rank)
-    pca.fit(hidden_states_flat)
-    
-    # Compute direction
-    direction = torch.tensor(pca.components_, device=device).mean(dim=0)
-    direction = direction.view(1, -1).repeat(max_length, 1)
-    
-    # Compute neg_emb
-    neg_emb = neg_all.mean(dim=0)
-
-    return direction, neg_emb
+    pca = PCA(n_components=rank).to(fit_data.device).fit(fit_data.float())
+    eval_data =  pca.transform(fit_data.float())
+    h_pca = pca.inverse_transform(eval_data) 
+    direction = (pca.components_.sum(dim=0,keepdim=True) + pca.mean_).mean(0).view(hidden_states[demonstration_id][0].size(0), hidden_states[demonstration_id][0].size(1))#h_pca.mean(0).view(hidden_states[demonstration_id][0].size(0), hidden_states[demonstration_id][0].size(1))
+    return direction, (neg_emb).view(hidden_states[demonstration_id][0].size(0), hidden_states[demonstration_id][0].size(1))
 icvs, neg_emb = compute_icv(model, tokenized_demos)
 
 # Updated hook function to handle tuple output
@@ -151,17 +145,19 @@ icvs, neg_emb = compute_icv(model, tokenized_demos)
 # Example query
 sysPrompt="<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are a helpful AI assistant for paraphrasing sentences. Only provide the paraphrased sentence<|eot_id|>"
 
-sQuery = "<|start_header_id|>user<|end_header_id|>This is the worst restaurant ever!<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
+sQuery = "<|start_header_id|>user<|end_header_id|>This is the worst!<|eot_id|><|start_header_id|>assistant<|end_header_id|>"
 
 query = sysPrompt+sQuery
 # Tokenize query
-query_inputs = tokenizer(query, return_tensors='pt')
+query_inputs = tokenizer(query, return_tensors='pt').to("cuda")
 
 # Generate response
 with torch.no_grad():
     output = model.generate(
-        input_ids=torch.tensor(query_inputs['input_ids']).unsqueeze(0).cuda(),
-        attention_mask=torch.tensor(query_inputs['attention_mask']).unsqueeze(0).cuda(),
+        # input_ids=torch.tensor(query_inputs['input_ids']).unsqueeze(0).cuda(),
+        # attention_mask=torch.tensor(query_inputs['attention_mask']).unsqueeze(0).cuda(),
+        input_ids=query_inputs['input_ids'],
+        attention_mask=query_inputs['attention_mask'],
         max_new_tokens=50,
         temperature=0.7,
         do_sample=True,
@@ -173,7 +169,7 @@ response = tokenizer.decode(output[0], skip_special_tokens=True)
 print("Original Response:", response)
 
 # apply_icvs(model, icvs)
-alpha = [0.1] * len(model.model.layers)  # Assuming a uniform alpha for simplicity
+alpha = [1] * len(model.model.layers)  # Assuming a uniform alpha for simplicity
 add_icv_layers(model, icvs, alpha)
 
 # Tokenize query
