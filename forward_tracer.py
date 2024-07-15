@@ -2,7 +2,7 @@ from dataclasses import asdict, dataclass
 from typing import Dict, Optional
 import torch
 from transformers import PreTrainedModel
-from .llm_layers import get_embedding_layer, get_layers
+from llm_layers import get_embedding_layer, get_layers
 
 @dataclass
 class ResidualStream:

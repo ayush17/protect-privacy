@@ -133,10 +133,8 @@ def get_mlp_layers(model: PreTrainedModel):
 
 def add_icv_layers(model: PreTrainedModel, icv: Tensor, alpha: list):
     layers = get_layers(model)
-    # print(layers)
+    print(layers)
     mlp_keywords = ["mlp", "feedforward", "ffn"]
-    print("LEN ICV",len(icv))
-    print("LEN layers",len(layers))
     assert len(icv) == len(layers)
     for i, layer in enumerate(layers):
         original_mlp = find_module(layer, mlp_keywords)
